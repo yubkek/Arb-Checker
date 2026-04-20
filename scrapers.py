@@ -54,6 +54,37 @@ def _parse_odds(text: str) -> Optional[float]:
     return None
 
 
+_VIRTUAL_TEAM_WORDS = {
+    "city", "fc", "united", "rangers", "rovers", "reds", "blues", "stars",
+    "whites", "greens", "juniors", "seniors", "farmers", "boys", "athletic",
+    "hotspur", "wanderers", "dynamo", "olympic", "sporting",
+}
+
+
+def _clean_name(text: str) -> str:
+    """Strip live indicators, replacement chars, and trailing junk from scraped names."""
+    text = text.replace("\uFFFD", "").replace("\u25CF", "").replace("\u2022", "")
+    text = re.sub(r"[^\x20-\x7E\u00C0-\u024F/]", "", text)  # keep Latin + ASCII
+    # Strip trailing live-indicator 'v'/'V' appended by Sportsbet on live events.
+    # Space-separated case (" v" / " V") is always safe to strip.
+    text = re.sub(r"\s+[Vv]$", "", text)
+    # Attached case: only strip when preceded by a consonant (safe — avoids corrupting
+    # real Slavic surnames ending in -ev/-ov/-av like Medvedev, Rublev, Khachanov).
+    text = re.sub(r"(?<=[bcdfghjklmnpqrstwxyz])[Vv]$", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def _is_virtual_team(name: str) -> bool:
+    """Detect Betfair Simulated Reality team names (not real tennis players)."""
+    return bool(set(name.lower().split()) & _VIRTUAL_TEAM_WORDS)
+
+
+def _valid_match_odds(oh: float, od: float, oa: float) -> bool:
+    """Reject outright/futures markets — implied probs must sum to 75%–135%."""
+    total = (1 / oh) + (1 / od) + (1 / oa)
+    return 0.75 <= total <= 1.35
+
+
 async def _safe_text(el, default: str = "") -> str:
     try:
         return (await el.inner_text()).strip()
@@ -109,8 +140,8 @@ async def scrape_sportsbet(ctx: BrowserContext) -> list[dict]:
                 odd_els = await card.query_selector_all(ODDS_SEL)
                 if not (p1_el and p2_el and len(odd_els) >= 2):
                     continue
-                p1 = await _safe_text(p1_el)
-                p2 = await _safe_text(p2_el)
+                p1 = _clean_name(await _safe_text(p1_el))
+                p2 = _clean_name(await _safe_text(p2_el))
                 o1 = _parse_odds(await _safe_text(odd_els[0]))
                 o2 = _parse_odds(await _safe_text(odd_els[1]))
                 if p1 and p2 and o1 and o2:
@@ -146,8 +177,8 @@ async def _scrape_entain_tennis(ctx: BrowserContext, url: str, name: str) -> lis
         for i in range(0, len(buttons) - 1, 2):
             try:
                 b1, b2 = buttons[i], buttons[i + 1]
-                n1 = await _safe_text(await b1.query_selector(NAME_SEL))
-                n2 = await _safe_text(await b2.query_selector(NAME_SEL))
+                n1 = _clean_name(await _safe_text(await b1.query_selector(NAME_SEL)))
+                n2 = _clean_name(await _safe_text(await b2.query_selector(NAME_SEL)))
                 o1 = _parse_odds(await _safe_text(await b1.query_selector(ODDS_SEL)))
                 o2 = _parse_odds(await _safe_text(await b2.query_selector(ODDS_SEL)))
                 if n1 and n2 and o1 and o2 and n1.lower() != "draw":
@@ -187,8 +218,8 @@ async def scrape_bet365(ctx: BrowserContext) -> list[dict]:
         odds  = await page.query_selector_all(ODDS_SEL)
         for i in range(0, min(len(names), len(odds)) - 1, 2):
             try:
-                p1 = await _safe_text(names[i])
-                p2 = await _safe_text(names[i + 1])
+                p1 = _clean_name(await _safe_text(names[i]))
+                p2 = _clean_name(await _safe_text(names[i + 1]))
                 o1 = _parse_odds(await _safe_text(odds[i]))
                 o2 = _parse_odds(await _safe_text(odds[i + 1]))
                 if p1 and p2 and o1 and o2:
@@ -221,11 +252,13 @@ async def scrape_betfair(ctx: BrowserContext) -> list[dict]:
         prices = await page.query_selector_all('[class*="ui-display-decimal-price"]')
         for i in range(0, min(len(names), len(prices)) - 1, 2):
             try:
-                p1 = await _safe_text(names[i])
-                p2 = await _safe_text(names[i + 1])
+                p1 = _clean_name(await _safe_text(names[i]))
+                p2 = _clean_name(await _safe_text(names[i + 1]))
                 o1 = _parse_odds(await _safe_text(prices[i]))
                 o2 = _parse_odds(await _safe_text(prices[i + 1]))
-                if p1 and p2 and o1 and o2 and "draw" not in p1.lower() and "draw" not in p2.lower():
+                if (p1 and p2 and o1 and o2
+                        and "draw" not in p1.lower() and "draw" not in p2.lower()
+                        and not _is_virtual_team(p1) and not _is_virtual_team(p2)):
                     results.append({"match": f"{p1} v {p2}", "player1": p1, "player2": p2,
                                     "odds1": o1, "odds2": o2, "bookmaker": "Betfair Exchange"})
             except Exception as exc:
@@ -268,12 +301,12 @@ async def scrape_sportsbet_soccer(ctx: BrowserContext) -> list[dict]:
                 odd_els = await card.query_selector_all(ODDS_SEL)
                 if not (t1_el and t2_el and len(odd_els) >= 3):
                     continue
-                t1 = await _safe_text(t1_el)
-                t2 = await _safe_text(t2_el)
+                t1 = _clean_name(await _safe_text(t1_el))
+                t2 = _clean_name(await _safe_text(t2_el))
                 oh = _parse_odds(await _safe_text(odd_els[0]))
                 od = _parse_odds(await _safe_text(odd_els[1]))
                 oa = _parse_odds(await _safe_text(odd_els[2]))
-                if t1 and t2 and oh and od and oa:
+                if t1 and t2 and oh and od and oa and _valid_match_odds(oh, od, oa):
                     results.append({"match": f"{t1} v {t2}", "team1": t1, "team2": t2,
                                     "odds_home": oh, "odds_draw": od, "odds_away": oa,
                                     "bookmaker": "Sportsbet"})
@@ -311,16 +344,16 @@ async def _scrape_entain_soccer(ctx: BrowserContext, url: str, name: str) -> lis
         for i in range(0, len(buttons) - 2, 3):
             try:
                 bh, bd, ba = buttons[i], buttons[i + 1], buttons[i + 2]
-                t1  = await _safe_text(await bh.query_selector(NAME_SEL))
+                t1  = _clean_name(await _safe_text(await bh.query_selector(NAME_SEL)))
                 mid = await _safe_text(await bd.query_selector(NAME_SEL))
-                t2  = await _safe_text(await ba.query_selector(NAME_SEL))
+                t2  = _clean_name(await _safe_text(await ba.query_selector(NAME_SEL)))
                 oh  = _parse_odds(await _safe_text(await bh.query_selector(ODDS_SEL)))
                 od  = _parse_odds(await _safe_text(await bd.query_selector(ODDS_SEL)))
                 oa  = _parse_odds(await _safe_text(await ba.query_selector(ODDS_SEL)))
                 # Validate the middle button really is the draw
                 if mid.lower() not in ("draw", "x", "tie"):
                     continue
-                if t1 and t2 and oh and od and oa:
+                if t1 and t2 and oh and od and oa and _valid_match_odds(oh, od, oa):
                     results.append({"match": f"{t1} v {t2}", "team1": t1, "team2": t2,
                                     "odds_home": oh, "odds_draw": od, "odds_away": oa,
                                     "bookmaker": name})
@@ -359,15 +392,15 @@ async def scrape_bet365_soccer(ctx: BrowserContext) -> list[dict]:
         odds  = await page.query_selector_all(ODDS_SEL)
         for i in range(0, min(len(names), len(odds)) - 2, 3):
             try:
-                t1  = await _safe_text(names[i])
+                t1  = _clean_name(await _safe_text(names[i]))
                 mid = await _safe_text(names[i + 1])
-                t2  = await _safe_text(names[i + 2])
+                t2  = _clean_name(await _safe_text(names[i + 2]))
                 oh  = _parse_odds(await _safe_text(odds[i]))
                 od  = _parse_odds(await _safe_text(odds[i + 1]))
                 oa  = _parse_odds(await _safe_text(odds[i + 2]))
                 if mid.lower() not in ("draw", "x", "the draw"):
                     continue
-                if t1 and t2 and oh and od and oa:
+                if t1 and t2 and oh and od and oa and _valid_match_odds(oh, od, oa):
                     results.append({"match": f"{t1} v {t2}", "team1": t1, "team2": t2,
                                     "odds_home": oh, "odds_draw": od, "odds_away": oa,
                                     "bookmaker": "Bet365"})
@@ -399,15 +432,15 @@ async def scrape_betfair_soccer(ctx: BrowserContext) -> list[dict]:
         prices = await page.query_selector_all('[class*="ui-display-decimal-price"]')
         for i in range(0, min(len(names), len(prices)) - 2, 3):
             try:
-                t1  = await _safe_text(names[i])
+                t1  = _clean_name(await _safe_text(names[i]))
                 mid = await _safe_text(names[i + 1])
-                t2  = await _safe_text(names[i + 2])
+                t2  = _clean_name(await _safe_text(names[i + 2]))
                 oh  = _parse_odds(await _safe_text(prices[i]))
                 od  = _parse_odds(await _safe_text(prices[i + 1]))
                 oa  = _parse_odds(await _safe_text(prices[i + 2]))
                 if "draw" not in mid.lower():
                     continue
-                if t1 and t2 and oh and od and oa:
+                if t1 and t2 and oh and od and oa and _valid_match_odds(oh, od, oa):
                     results.append({"match": f"{t1} v {t2}", "team1": t1, "team2": t2,
                                     "odds_home": oh, "odds_draw": od, "odds_away": oa,
                                     "bookmaker": "Betfair Exchange"})

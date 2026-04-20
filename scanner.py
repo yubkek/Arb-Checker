@@ -267,6 +267,12 @@ async def run_scan(seen_tennis: set, seen_soccer: set, scan_num: int) -> None:
         draw = max(data["draw_bets"], key=lambda x: x["odds"])
         away = max(data["away_bets"], key=lambda x: x["odds"])
         ap     = _arb3(home["odds"], draw["odds"], away["odds"])
+        # Reject combined odds that don't look like a real 1X2 market.
+        # Taking MAX odds independently can mix entries from different markets
+        # (e.g. group-stage futures merged via fuzzy match), producing impossible
+        # implied-prob sums. Filter these out before showing anything.
+        if not (0.75 <= ap <= 1.35):
+            continue
         # Require at least 2 different bookmakers AND a realistic margin cap.
         # Single-bookie "arbs" are virtual/promo markets that can't be cross-booked.
         bookies_involved = len({home["bookmaker"], draw["bookmaker"], away["bookmaker"]})
