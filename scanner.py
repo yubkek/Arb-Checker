@@ -15,9 +15,11 @@ Switching Betfair to the official API:
 """
 
 import asyncio
+import json
 import logging
 import re
 import sys
+import time
 from datetime import datetime
 
 from rapidfuzz import fuzz, process
@@ -29,6 +31,7 @@ from scrapers import scrape_all_bookmakers
 # ---------------------------------------------------------------------------
 
 LOG_FILE        = "arb_log.txt"
+SCAN_DATA_FILE  = "scan_data.json"
 SCAN_INTERVAL   = 60     # seconds between scans
 TOTAL_STAKE     = 100.0  # AUD for stake-split calculation
 FUZZY_THRESHOLD = 82     # min rapidfuzz score (0–100) to merge player names
@@ -158,19 +161,40 @@ def _log(message: str) -> None:
     with open(LOG_FILE, "a", encoding="utf-8") as fh:
         fh.write(message + "\n\n")
 
+
+def _write_scan_data(matches: list[dict], source_counts: dict, scan_num: int) -> None:
+    data = {
+        "last_scan":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "last_scan_ts":  time.time(),
+        "scan_num":      scan_num,
+        "scan_interval": SCAN_INTERVAL,
+        "total_matches": len(matches),
+        "arb_count":     sum(1 for m in matches if m["is_arb"]),
+        "source_counts": source_counts,
+        "matches":       matches,
+    }
+    with open(SCAN_DATA_FILE, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+
 # ---------------------------------------------------------------------------
 # Scan cycle
 # ---------------------------------------------------------------------------
 
-async def run_scan(seen_arbs: set[str]) -> int:
+async def run_scan(seen_arbs: set[str], scan_num: int) -> int:
     """
-    One full scan cycle. Scrapes all sources, finds arbs, logs new ones.
+    One full scan cycle. Scrapes all sources, finds arbs, logs new ones,
+    writes scan_data.json for the dashboard.
     Returns the number of new arbs found. `seen_arbs` is mutated in-place.
     """
     logger.info("--- Scan started ---")
 
     all_odds = await scrape_all_bookmakers()
     logger.info("Total raw odds entries: %d", len(all_odds))
+
+    source_counts: dict[str, int] = {}
+    for entry in all_odds:
+        bk = entry.get("bookmaker", "Unknown")
+        source_counts[bk] = source_counts.get(bk, 0) + 1
 
     if not all_odds:
         logger.warning("No odds retrieved. Check scraper selectors and network access.")
@@ -179,7 +203,9 @@ async def run_scan(seen_arbs: set[str]) -> int:
     groups = consolidate(all_odds)
     logger.info("Unique matches after consolidation: %d", len(groups))
 
+    matches: list[dict] = []
     new_count = 0
+
     for match_key, data in groups.items():
         best    = best_odds_per_player(data["bets"])
         players = list(best.values())
@@ -188,10 +214,29 @@ async def run_scan(seen_arbs: set[str]) -> int:
             continue
 
         p1_bet, p2_bet = players[0], players[1]
-        ap = _arb_pct(p1_bet["odds"], p2_bet["odds"])
+        ap     = _arb_pct(p1_bet["odds"], p2_bet["odds"])
+        is_arb = ap < 1.0
 
-        if ap < 1.0:
-            # Include odds in the ID so a price movement triggers a fresh alert
+        row: dict = {
+            "match":    match_key.replace(" | ", " vs ").title(),
+            "player1":  p1_bet["player"].title(),
+            "bookie1":  p1_bet["bookmaker"],
+            "odds1":    p1_bet["odds"],
+            "player2":  p2_bet["player"].title(),
+            "bookie2":  p2_bet["bookmaker"],
+            "odds2":    p2_bet["odds"],
+            "arb_pct":  round(ap, 5),
+            "margin":   round((1 - ap) * 100, 3),
+            "is_arb":   is_arb,
+            "stake1":   None,
+            "stake2":   None,
+            "profit":   None,
+        }
+
+        if is_arb:
+            s1, s2, profit = _stake_split(p1_bet["odds"], p2_bet["odds"])
+            row.update({"stake1": s1, "stake2": s2, "profit": profit})
+
             arb_id = (
                 f"{match_key}::"
                 f"{p1_bet['bookmaker']}@{p1_bet['odds']:.3f}::"
@@ -203,6 +248,13 @@ async def run_scan(seen_arbs: set[str]) -> int:
                 print(alert)
                 _log(alert)
                 new_count += 1
+
+        matches.append(row)
+
+    # Sort: arbs first (by margin desc), then by margin ascending
+    matches.sort(key=lambda m: (not m["is_arb"], m["arb_pct"]))
+
+    _write_scan_data(matches, source_counts, scan_num)
 
     if new_count == 0:
         logger.info("No new arbs found this scan.")
@@ -227,7 +279,7 @@ async def main() -> None:
         scan_num += 1
         logger.info("Scan #%d", scan_num)
         try:
-            await run_scan(seen_arbs)
+            await run_scan(seen_arbs, scan_num)
         except Exception as exc:
             logger.error("Unexpected error during scan #%d: %s", scan_num, exc, exc_info=True)
 
